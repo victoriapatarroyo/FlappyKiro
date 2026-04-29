@@ -7,13 +7,22 @@ on:
     branches: [main]
   workflow_dispatch:   # Permite trigger manual desde GitHub UI
 
+# Permisos necesarios para que GitHub Actions pueda publicar en GitHub Pages
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Evita deploys simultáneos; si hay uno en curso, el nuevo espera
+concurrency:
+  group: "pages"
+  cancel-in-progress: false
+
 env:
   PYTHON_VERSION: "3.11"
-  NODE_VERSION: "20"
-  AWS_REGION: "us-east-1"
 
 jobs:
-  # ── Job 1: Tests ────────────────────────────────────────────────────────────
+  # ── Job 1: Tests ─────────────────────────────────────────────────────────────
   test:
     name: Run Tests
     runs-on: ubuntu-latest
@@ -32,7 +41,7 @@ jobs:
         run: |
           pip install --upgrade pip
           pip install -r requirements.txt
-          # pygame en CI necesita un display virtual
+          # pygame en CI necesita librerías SDL para no fallar al importar
           sudo apt-get install -y libsdl2-dev libsdl2-image-dev libsdl2-mixer-dev
 
       - name: Run tests
@@ -41,7 +50,7 @@ jobs:
           SDL_AUDIODRIVER: dummy
         run: pytest flappy_kiro/tests/ -v --tb=short
 
-  # ── Job 2: Build WASM con Pygbag ────────────────────────────────────────────
+  # ── Job 2: Build WASM con Pygbag ─────────────────────────────────────────────
   build:
     name: Build Web (Pygbag)
     runs-on: ubuntu-latest
@@ -64,129 +73,37 @@ jobs:
 
       - name: Build with Pygbag
         run: |
-          # Pygbag empaqueta el juego como WASM
-          # --build genera el output en build/web/
           python -m pygbag --build \
             --app_name "Flappy Kiro" \
             --width 400 \
             --height 600 \
             flappy_kiro/main_web.py
 
-      - name: Upload build artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: web-build
-          path: build/web/
-          retention-days: 7
+      - name: Setup GitHub Pages
+        uses: actions/configure-pages@v5
 
-  # ── Job 3: Deploy infraestructura CDK (solo en push a main) ─────────────────
-  deploy-infra:
-    name: Deploy CDK Infrastructure
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: build/web/
+
+  # ── Job 3: Deploy a GitHub Pages (solo en push a main) ───────────────────────
+  deploy:
+    name: Deploy to GitHub Pages
     runs-on: ubuntu-latest
     needs: build
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
 
-    outputs:
-      bucket_name: ${{ steps.cdk-outputs.outputs.bucket_name }}
-      distribution_id: ${{ steps.cdk-outputs.outputs.distribution_id }}
-      cloudfront_url: ${{ steps.cdk-outputs.outputs.cloudfront_url }}
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
 
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: ${{ env.PYTHON_VERSION }}
-          cache: pip
-
-      - name: Set up Node.js (CDK CLI)
-        uses: actions/setup-node@v4
-        with:
-          node-version: ${{ env.NODE_VERSION }}
-
-      - name: Install CDK CLI
-        run: npm install -g aws-cdk@2
-
-      - name: Install CDK Python dependencies
-        working-directory: infra
-        run: |
-          pip install --upgrade pip
-          pip install -r requirements.txt
-
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ env.AWS_REGION }}
-
-      - name: CDK Bootstrap (idempotente, solo la primera vez)
-        working-directory: infra
-        run: cdk bootstrap --context account=${{ secrets.AWS_ACCOUNT_ID }}
-
-      - name: CDK Deploy
-        working-directory: infra
-        run: |
-          cdk deploy FlappyKiroHostingStack \
-            --require-approval never \
-            --context account=${{ secrets.AWS_ACCOUNT_ID }} \
-            --context region=${{ env.AWS_REGION }} \
-            --outputs-file cdk-outputs.json
-
-      - name: Parse CDK outputs
-        id: cdk-outputs
-        working-directory: infra
-        run: |
-          BUCKET=$(jq -r '.FlappyKiroHostingStack.BucketName' cdk-outputs.json)
-          DIST_ID=$(jq -r '.FlappyKiroHostingStack.DistributionId' cdk-outputs.json)
-          URL=$(jq -r '.FlappyKiroHostingStack.CloudFrontURL' cdk-outputs.json)
-          echo "bucket_name=$BUCKET" >> $GITHUB_OUTPUT
-          echo "distribution_id=$DIST_ID" >> $GITHUB_OUTPUT
-          echo "cloudfront_url=$URL" >> $GITHUB_OUTPUT
-          echo "🌐 Game URL: $URL"
-
-  # ── Job 4: Deploy contenido a S3 + invalidar CloudFront ─────────────────────
-  deploy-content:
-    name: Deploy Game to S3
-    runs-on: ubuntu-latest
-    needs: deploy-infra
-    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
-
-    steps:
-      - name: Download build artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: web-build
-          path: build/web/
-
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ env.AWS_REGION }}
-
-      - name: Sync build to S3
-        run: |
-          aws s3 sync build/web/ s3://${{ needs.deploy-infra.outputs.bucket_name }}/ \
-            --delete \
-            --cache-control "public, max-age=31536000, immutable" \
-            --exclude "index.html"
-
-          # index.html sin cache para que siempre sirva la versión más reciente
-          aws s3 cp build/web/index.html \
-            s3://${{ needs.deploy-infra.outputs.bucket_name }}/index.html \
-            --cache-control "no-cache, no-store, must-revalidate"
-
-      - name: Invalidate CloudFront cache
-        run: |
-          aws cloudfront create-invalidation \
-            --distribution-id ${{ needs.deploy-infra.outputs.distribution_id }} \
-            --paths "/*"
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
 
       - name: Print game URL
         run: |
           echo "✅ Deploy completado!"
-          echo "🎮 Juega en: ${{ needs.deploy-infra.outputs.cloudfront_url }}"
+          echo "🎮 Juega en: ${{ steps.deployment.outputs.page_url }}"
